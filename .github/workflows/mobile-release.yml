@@ -1,0 +1,156 @@
+name: PawCare mobile release
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Build and upload to a testing track
+        required: true
+        type: choice
+        options:
+          - android
+          - ios
+          - both
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    if: inputs.platform == 'android' || inputs.platform == 'both'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile-store/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Check Android release credentials
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PLAY_KEY: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          for value in "$KEYSTORE" "$STORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" "$PLAY_KEY"; do
+            if [ -z "$value" ]; then echo "Android publishing secrets are incomplete. Follow mobile-store/MOBILE-RELEASE.md."; exit 1; fi
+          done
+      - name: Install dependencies and generate Android project
+        working-directory: mobile-store
+        run: |
+          npm ci
+          npm run build
+          npx cap add android
+          npx cap sync android
+      - name: Sign Android App Bundle
+        working-directory: mobile-store
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          export ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/pawcare-upload.keystore"
+          node -e "require('fs').writeFileSync(process.env.ANDROID_KEYSTORE_PATH, Buffer.from(process.env.ANDROID_KEYSTORE_BASE64, 'base64'))"
+          node scripts/configure-android-release.mjs
+          cd android
+          ./gradlew bundleRelease
+      - name: Upload to Google Play internal testing
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.millit9096.pawcare
+          releaseFiles: mobile-store/android/app/build/outputs/bundle/release/app-release.aab
+          track: internal
+          status: completed
+
+  ios:
+    if: inputs.platform == 'ios' || inputs.platform == 'both'
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: mobile-store/package-lock.json
+      - name: Check Apple release credentials
+        env:
+          CERTIFICATE: ${{ secrets.APPLE_DISTRIBUTION_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_P12_PASSWORD }}
+          API_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          API_ISSUER: ${{ vars.APPSTORE_ISSUER_ID }}
+          API_KEY_ID: ${{ vars.APPSTORE_API_KEY_ID }}
+          TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          PROFILE_NAME: ${{ vars.IOS_PROFILE_NAME }}
+        run: |
+          for value in "$CERTIFICATE" "$CERT_PASSWORD" "$API_PRIVATE_KEY" "$API_ISSUER" "$API_KEY_ID" "$TEAM_ID" "$PROFILE_NAME"; do
+            if [ -z "$value" ]; then echo "Apple publishing secrets/variables are incomplete. Follow mobile-store/MOBILE-RELEASE.md."; exit 1; fi
+          done
+      - name: Install dependencies and generate iOS project
+        working-directory: mobile-store
+        run: |
+          npm ci
+          npm run build
+          npx cap add ios
+          npx cap sync ios
+      - name: Import Apple Distribution certificate
+        uses: apple-actions/import-codesign-certs@v7
+        with:
+          p12-file-base64: ${{ secrets.APPLE_DISTRIBUTION_P12_BASE64 }}
+          p12-password: ${{ secrets.APPLE_DISTRIBUTION_P12_PASSWORD }}
+      - name: Download App Store provisioning profile
+        uses: apple-actions/download-provisioning-profiles@v6
+        with:
+          bundle-id: com.millit9096.pawcare
+          issuer-id: ${{ vars.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ vars.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+      - name: Create export options
+        working-directory: mobile-store
+        env:
+          TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          PROFILE_NAME: ${{ vars.IOS_PROFILE_NAME }}
+        run: |
+          plutil -create xml1 export-options.plist
+          /usr/libexec/PlistBuddy -c "Add :method string app-store-connect" export-options.plist
+          /usr/libexec/PlistBuddy -c "Add :teamID string $TEAM_ID" export-options.plist
+          /usr/libexec/PlistBuddy -c "Add :signingStyle string manual" export-options.plist
+          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles dict" export-options.plist
+          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:com.millit9096.pawcare string $PROFILE_NAME" export-options.plist
+      - name: Archive and export signed iOS app
+        id: ios-build
+        uses: Apple-Actions/xcodebuild@v1
+        with:
+          project: ios/App/App.xcodeproj
+          scheme: App
+          sdk: iphoneos
+          action: archive
+          archive-path: ${{ runner.temp }}/PawCare.xcarchive
+          export-options-plist: export-options.plist
+          export-path: ${{ runner.temp }}/PawCare-export
+          build-number: ${{ github.run_number }}
+          destination: generic/platform=iOS
+          working-directory: mobile-store
+          build-settings: |
+            DEVELOPMENT_TEAM=${{ vars.APPLE_TEAM_ID }}
+            PRODUCT_BUNDLE_IDENTIFIER=com.millit9096.pawcare
+            CODE_SIGN_STYLE=Manual
+            PROVISIONING_PROFILE_SPECIFIER=${{ vars.IOS_PROFILE_NAME }}
+      - name: Upload to TestFlight
+        uses: apple-actions/upload-testflight-build@v5
+        with:
+          app-path: ${{ steps.ios-build.outputs.ipa-path }}
+          issuer-id: ${{ vars.APPSTORE_ISSUER_ID }}
+          api-key-id: ${{ vars.APPSTORE_API_KEY_ID }}
+          api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          uses-non-exempt-encryption: 'false'
+
