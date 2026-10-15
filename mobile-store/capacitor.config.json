@@ -1,0 +1,15 @@
+{
+  "appId": "com.millit9096.pawcare",
+  "appName": "PawCare",
+  "webDir": "www",
+  "ios": {
+    "contentInset": "automatic"
+  },
+  "plugins": {
+    "LocalNotifications": {
+      "smallIcon": "ic_stat_icon_config_sample",
+      "iconColor": "#17463c"
+    }
+  }
+}
+
