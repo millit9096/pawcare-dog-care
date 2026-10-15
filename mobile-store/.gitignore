@@ -1,0 +1,9 @@
+node_modules/
+site/
+www/
+android/
+ios/
+*.keystore
+*.p12
+*.mobileprovision
+
